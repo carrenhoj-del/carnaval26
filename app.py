@@ -119,7 +119,7 @@ st.markdown("Digite o nome (ou parte) do bloquinho. O app sugere o mais prováve
 
 # carregar dados
 try:
-    df_raw = pd.read_csv(CSV_PATH)
+    df_raw = pd.read_csv(CSV_PATH, sep=";", encoding="utf-8")
 except FileNotFoundError:
     st.error(f"Arquivo '{CSV_PATH}' não encontrado. Faça upload no repositório ou verifique o nome.")
     st.stop()
