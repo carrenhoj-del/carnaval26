@@ -5,6 +5,7 @@ from geopy.geocoders import Nominatim
 from geopy.distance import geodesic
 from dateutil import parser
 import time
+from typing import Optional, Tuple, List, Dict
 
 st.set_page_config(page_title="Blocos Próximos 🎭", layout="centered")
 
@@ -20,7 +21,7 @@ def get_geocoder():
     return Nominatim(user_agent="blocos_carnaval_app")
 
 @st.cache_data
-def geocode_address(address: str):
+def geocode_address(address: str) -> Optional[Tuple[float, float]]:
     """
     Geocodifica um endereço (string) e retorna (lat, lon) ou None.
     Cacheado por Streamlit para não reprocurar várias vezes.
@@ -61,9 +62,7 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     Normaliza nomes de colunas esperadas (insensível a maiúsc/minúsc)
     e garante as colunas internas: 'Data'(string), 'Bloco', 'Horário', 'Bairro', 'Partida', 'Dispersao'
     """
-    # criar mapa de colunas por versão lower stripped
     col_map = {c.lower().strip(): c for c in df.columns}
-    # busca chaves esperadas
     def get_col(*possibles):
         for p in possibles:
             key = p.lower().strip()
@@ -72,7 +71,6 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         return None
 
     mapping = {}
-    # suas colunas explicitamente: Índice; Data; Bloco; Horário; Bairro; partida; dispersao.
     c_data = get_col("data")
     c_bloco = get_col("bloco")
     c_hor = get_col("horário", "horario")
@@ -98,24 +96,82 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     mapping[c_disp] = "Dispersao"
 
     df = df.rename(columns=mapping)
-    # garantir tipos string/strip
     for col in ["Data", "Bloco", "Horário", "Bairro", "Partida", "Dispersao"]:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip()
         else:
-            df[col] = ""  # criar coluna vazia se não existir (defensivo)
+            df[col] = ""
 
-    # parse horário para facilitar comparação (Timestamp com data genérica)
     df["Horario_dt"] = df["Horário"].apply(try_parse_time)
-    # Mantemos a coluna 'Data' COMO STRING (sem parse) — comparação será por igualdade de string
     df["Data_str"] = df["Data"].astype(str).str.strip()
-
     return df
 
-# ---------- UI ----------
-st.title("🎭 Blocos Próximos (sem Google)")
+# ---------- utilitários de rota ----------
+def build_instance_options(df: pd.DataFrame, bloco_name: str) -> List[Tuple[int, str]]:
+    """
+    Quando um nome de bloco aparece várias vezes, retorna lista de (index, label) para seleção.
+    Label contem Data / Horário / Bairro / Partida para distinguir.
+    """
+    rows = df[df["Bloco"] == bloco_name]
+    opts = []
+    for idx, r in rows.iterrows():
+        label = f"{r['Data_str']} | {r['Horário']} | {r.get('Bairro','')} | {r.get('Partida','')}"
+        opts.append((int(idx), label))
+    return opts
 
-st.markdown("Digite o nome (ou parte) do bloquinho. O app sugere o mais provável; confirme para ver os blocos próximos no **mesmo** dia e com horário de início **>=** o do bloquinho selecionado.")
+def get_row_by_index(df: pd.DataFrame, idx: int) -> pd.Series:
+    return df.loc[idx]
+
+def find_candidates_from_origin(df: pd.DataFrame, origem: Tuple[float,float],
+                                data_ref: str, horario_ref: pd.Timestamp,
+                                exclude_idxs: List[int]=[]) -> pd.DataFrame:
+    """
+    Retorna DataFrame de candidatos (mesma data_str e horário >= horario_ref),
+    com coluna Distância_km calculada a partir de origem -> partida(candidato).
+    """
+    candidatos = []
+    for idx, row in df.iterrows():
+        if idx in exclude_idxs:
+            continue
+        if str(row["Data_str"]).strip() != str(data_ref).strip():
+            continue
+        if pd.isna(row["Horario_dt"]) or row["Horario_dt"] is None:
+            continue
+        try:
+            if row["Horario_dt"].time() < horario_ref.time():
+                continue
+        except Exception:
+            continue
+        destino = geocode_address(row["Partida"])
+        if not destino:
+            continue
+        try:
+            dist_km = geodesic(origem, destino).km
+        except Exception:
+            continue
+        candidatos.append({
+            "idx": idx,
+            "Bloco": row["Bloco"],
+            "Data": row["Data_str"],
+            "Horário": row["Horário"],
+            "Bairro": row.get("Bairro", ""),
+            "Partida": row["Partida"],
+            "Distância_km": round(dist_km, 3)
+        })
+    if not candidatos:
+        return pd.DataFrame(columns=["idx","Bloco","Data","Horário","Bairro","Partida","Distância_km"])
+    return pd.DataFrame(candidatos).sort_values("Distância_km")
+
+# ---------- UI ----------
+st.title("🎭 Blocos Próximos (rota com até 3 blocos)")
+
+st.markdown("""
+Escolha até 3 blocos (primeiro obrigatório).  
+Os campos são *selectboxes* pesquisáveis — digite para filtrar.  
+Deixe o segundo e/ou terceiro vazios para que o sistema **sugira** automaticamente as melhores opções, seguindo a lógica:
+- Origem do deslocamento = *Dispersão* do bloco anterior.
+- Destino do deslocamento = *Partida* do próximo bloco.
+""")
 
 # carregar dados
 try:
@@ -127,104 +183,262 @@ except Exception as e:
     st.error(f"Erro ao ler '{CSV_PATH}': {e}")
     st.stop()
 
-# normalizar e pré-processar
 try:
     df = normalize_columns(df_raw)
 except Exception as e:
     st.error(f"Erro ao processar colunas do CSV: {e}")
     st.stop()
 
-# lista de nomes (original)
-nomes_blocos = df["Bloco"].fillna("").tolist()
+# lista única de nomes (ordenada)
+nomes_unicos = sorted(df["Bloco"].dropna().unique().tolist())
+# adiciona placeholder vazio para permitir "vazio"
+nomes_options = [""] + nomes_unicos
 
-entrada = st.text_input("Nome do bloquinho (digite parte do nome):", value="")
+col1, col2, col3 = st.columns(3)
+with col1:
+    sel1_name = st.selectbox("1) Primeiro bloquinho (obrigatório)", nomes_options, index=0, help="Escolha o primeiro bloco — obrigatório.")
+with col2:
+    sel2_name = st.selectbox("2) Segundo bloquinho (opcional)", nomes_options, index=0, help="Opcional — deixe em branco para sugestão.")
+with col3:
+    sel3_name = st.selectbox("3) Último bloquinho (opcional)", nomes_options, index=0, help="Opcional — deixe em branco para sugestão.")
 
-if entrada:
-    # fuzzy match
-    match = process.extractOne(entrada, nomes_blocos, scorer=fuzz.WRatio)
-    if not match:
-        st.warning("Nenhuma correspondência encontrada. Tente digitar outra parte do nome.")
+# validar requisito: primeiro selecionado
+if not sel1_name:
+    st.info("Escolha o primeiro bloquinho (campo 1) para começar a busca.")
+    st.stop()
+
+# escolher ocorrências (caso haja mais de uma com o mesmo nome)
+st.markdown("### Detalhe da ocorrência de cada bloco (quando houver mais de uma entrada com o mesmo nome)")
+def select_occurrence_for(name: str, col_label: str) -> Optional[int]:
+    opts = build_instance_options(df, name)
+    if not opts:
+        st.error(f"Nenhuma ocorrência encontrada para o bloco '{name}'. Verifique seu CSV.")
+        return None
+    if len(opts) == 1:
+        idx = opts[0][0]
+        st.write(f"{col_label}: **{name}** — {opts[0][1]}")
+        return idx
     else:
-        # extractOne pode retornar (choice, score, idx) - ser defensivo
-        nome_match = match[0]
-        score = match[1] if len(match) > 1 else None
-        try:
-            idx_match = match[2] if len(match) > 2 else nomes_blocos.index(nome_match)
-        except Exception:
-            idx_match = None
+        labels = [f"{i} | {lab}" for (i, lab) in opts]
+        choice = st.selectbox(f"{col_label} — escolha a ocorrência exata", [""] + labels)
+        if not choice:
+            st.info(f"Escolha a ocorrência exata para '{name}' (campo '{col_label}').")
+            return None
+        # extrair idx do label
+        idx_selected = int(choice.split("|")[0].strip())
+        return idx_selected
 
-        st.write(f"Correspondência sugerida: **{nome_match}** (score: {int(score)})")
-        col1, col2 = st.columns(2)
-        confirmar = col1.button("Sim, é esse", key="confirm")
-        tentar_novamente = col2.button("Não, vou tentar outro", key="retry")
+idx1 = select_occurrence_for(sel1_name, "Primeiro (1)")
+if idx1 is None:
+    st.stop()
 
-        if confirmar and idx_match is not None:
-            # selecionado: mostrar informações completas do bloco
-            bloco_atual = df.iloc[idx_match]
-            st.subheader("Bloco selecionado")
-            st.write(f"**Bloco:** {bloco_atual['Bloco']}")
-            st.write(f"**Data:** {bloco_atual['Data_str']}")
-            st.write(f"**Horário:** {bloco_atual['Horário']}")
-            st.write(f"**Bairro:** {bloco_atual.get('Bairro', '')}")
-            st.write(f"**Partida:** {bloco_atual['Partida']}")
-            st.write(f"**Dispersão:** {bloco_atual['Dispersao']}")
+idx2 = None
+if sel2_name:
+    idx2 = select_occurrence_for(sel2_name, "Segundo (2)")
+    if idx2 is None:
+        st.stop()
 
-            # validar horário e data
-            if pd.isna(bloco_atual["Horario_dt"]) or bloco_atual["Horario_dt"] is None:
-                st.error("Horário do bloco selecionado não pôde ser interpretado. O algoritmo exige horário legível para aplicar o filtro.")
+idx3 = None
+if sel3_name:
+    idx3 = select_occurrence_for(sel3_name, "Último (3)")
+    if idx3 is None:
+        st.stop()
+
+# carregar linhas selecionadas
+row1 = get_row_by_index(df, idx1)
+hora1 = row1["Horario_dt"]
+data1 = row1["Data_str"]
+st.subheader("Bloco 1 selecionado")
+st.write(f"**Bloco:** {row1['Bloco']}")
+st.write(f"**Data:** {data1}")
+st.write(f"**Horário:** {row1['Horário']}")
+st.write(f"**Partida:** {row1['Partida']}")
+st.write(f"**Dispersão:** {row1['Dispersao']}")
+
+if pd.isna(hora1) or hora1 is None:
+    st.error("Horário do primeiro bloco não pôde ser interpretado. É necessário um horário legível.")
+    st.stop()
+
+origem1 = geocode_address(row1["Dispersao"])
+if not origem1:
+    st.error("Não foi possível geocodificar a Dispersão do primeiro bloco. Sem coordenadas não é possível calcular rotas.")
+    st.stop()
+
+# Caso A: somente primeiro informado (sel2_name e sel3_name vazios)
+if not sel2_name and not sel3_name:
+    st.info("Somente o primeiro bloco foi informado — sugerindo blocos próximos como 2º e 3º.")
+    # sugerir candidatos para segundo com base em origem1
+    candidatos2 = find_candidates_from_origin(df, origem1, data1, hora1, exclude_idxs=[idx1]).head(TOP_K)
+    if candidatos2.empty:
+        st.info("Nenhum candidato encontrado para o segundo bloco com base no primeiro.")
+    else:
+        st.subheader("Sugestões para o 2º bloquinho (ordenadas por proximidade da dispersão do 1º → partida do candidato)")
+        st.dataframe(candidatos2.reset_index(drop=True)[["Bloco","Data","Horário","Bairro","Partida","Distância_km"]], use_container_width=True)
+
+        # Para cada candidato2 sugerir um candidato para o terceiro (a partir da dispersão do candidato2)
+        st.subheader("Para cada sugestão de 2º, sugerimos também um 3º próximo da dispersão do 2º")
+        rows_for_third = []
+        for _, cand in candidatos2.head(5).iterrows():  # limitar por performance
+            idx_cand2 = int(cand["idx"])
+            row_cand2 = get_row_by_index(df, idx_cand2)
+            # geocodificar dispersao do 2
+            origem2 = geocode_address(row_cand2["Dispersao"])
+            if not origem2:
+                continue
+            hora2 = row_cand2["Horario_dt"]
+            # buscar candidatos para terceiro (exclui idx1 e idx_cand2)
+            cand3_df = find_candidates_from_origin(df, origem2, row_cand2["Data_str"], hora2, exclude_idxs=[idx1, idx_cand2])
+            if cand3_df.empty:
+                continue
+            best3 = cand3_df.iloc[0]
+            rows_for_third.append({
+                "2º Bloco": row_cand2["Bloco"],
+                "2º Horário": row_cand2["Horário"],
+                "3º Sugerido": best3["Bloco"],
+                "3º Horário": best3["Horário"],
+                "Distância 2->3 (km)": best3["Distância_km"],
+                "Distância 1->2 (km)": cand["Distância_km"]
+            })
+        if rows_for_third:
+            st.dataframe(pd.DataFrame(rows_for_third), use_container_width=True)
+        else:
+            st.info("Não foi possível sugerir 3º bloco para as principais sugestões de 2º (falta de geocoding/horários).")
+
+
+# Caso B: primeiro e segundo informados -> calcular/auto-sugerir terceiro
+elif sel2_name and not sel3_name:
+    st.subheader("Você informou o 1º e o 2º — calculando o melhor 3º bloco (mais próximo da dispersão do 2º)")
+    row2 = get_row_by_index(df, idx2)
+    st.write("**Segundo (2)**")
+    st.write(f"Bloco: {row2['Bloco']} — Data: {row2['Data_str']} — Horário: {row2['Horário']}")
+    if pd.isna(row2["Horario_dt"]) or row2["Horario_dt"] is None:
+        st.error("Horário do segundo bloco não pôde ser interpretado. O algoritmo exige horário legível.")
+    else:
+        origem2 = geocode_address(row2["Dispersao"])
+        if not origem2:
+            st.error("Não foi possível geocodificar a Dispersão do 2º bloco — não é possível calcular o 3º.")
+        else:
+            # encontrar candidatos para terceiro a partir da dispersão do 2º
+            cand3_df = find_candidates_from_origin(df, origem2, row2["Data_str"], row2["Horario_dt"], exclude_idxs=[idx1, idx2])
+            if cand3_df.empty:
+                st.info("Nenhum candidato encontrado para o 3º bloco com base no 2º.")
             else:
-                origem = geocode_address(bloco_atual["Dispersao"])
-                if not origem:
-                    st.error("Não foi possível geocodificar o ponto de dispersão do bloco selecionado. Sem coordenadas não há cálculo de distâncias.")
-                else:
-                    candidatos = []
-                    data_ref = bloco_atual["Data_str"]
-                    horario_ref = bloco_atual["Horario_dt"].time()
+                best3 = cand3_df.iloc[0]
+                st.subheader("Sugestão automática para 3º (o mais próximo da dispersão do 2º)")
+                st.write(f"**Bloco:** {best3['Bloco']}")
+                st.write(f"**Data:** {best3['Data']}")
+                st.write(f"**Horário:** {best3['Horário']}")
+                st.write(f"**Partida:** {best3['Partida']}")
+                st.write(f"**Distância (km):** {best3['Distância_km']}")
 
-                    # percorrer outros blocos e aplicar filtros
-                    for idx, row in df.iterrows():
-                        # pular o mesmo bloco
-                        if idx == idx_match:
-                            continue
-                        # filtro 1: mesma Data (string exatamente igual)
-                        if str(row["Data_str"]).strip() != str(data_ref).strip():
-                            continue
-                        # filtro 2: horário conhecido e >= horário_ref
-                        if pd.isna(row["Horario_dt"]) or row["Horario_dt"] is None:
-                            continue
-                        try:
-                            if row["Horario_dt"].time() < horario_ref:
-                                continue
-                        except Exception:
-                            continue
-                        # geocodificar partida do candidato
-                        destino = geocode_address(row["Partida"])
-                        if not destino:
-                            # pular candidato sem coordenadas
-                            continue
-                        # calcular distância (km)
-                        try:
-                            dist_km = geodesic(origem, destino).km
-                        except Exception:
-                            continue
-                        candidatos.append({
-                            "Bloco": row["Bloco"],
-                            "Data": row["Data_str"],
-                            "Horário": row["Horário"],
-                            "Bairro": row.get("Bairro", ""),
-                            "Partida": row["Partida"],
-                            "Distância_km": round(dist_km, 3)
-                        })
 
-                    if not candidatos:
-                        st.info("Nenhum bloco candidato encontrado após aplicar os filtros de data e horário.")
-                    else:
-                        resultado = pd.DataFrame(candidatos).sort_values("Distância_km").head(TOP_K)
-                        st.subheader(f"Top {min(TOP_K, len(resultado))} blocos próximos (mesmo dia, horário >= selecionado)")
-                        st.dataframe(resultado.reset_index(drop=True), use_container_width=True)
+# Caso C: primeiro e último informados -> sugerir segundo(s) próximos da dispersão do primeiro
+elif sel3_name and not sel2_name:
+    st.subheader("Você informou o 1º e o 3º — sugerindo opções para o 2º entre eles")
+    row3 = get_row_by_index(df, idx3)
+    st.write("**Último (3)**")
+    st.write(f"Bloco: {row3['Bloco']} — Data: {row3['Data_str']} — Horário: {row3['Horário']}")
+    # Requer que datas sejam compatíveis (mesmo dia) para sequência lógica
+    if row3["Data_str"] != data1:
+        st.warning("O 1º e o 3º selecionados têm datas diferentes. A sugestão de 2º será limitada a blocos com DATA IGUAL ao do 1º.")
+    # buscar candidatos 2º: mesmo dia, horário >= 1º horário e <= 3º horário (se este último tiver horário válido)
+    hora3 = row3["Horario_dt"]
+    hora_min = hora1
+    hora_max = None
+    if pd.notna(hora3):
+        hora_max = hora3
+    candidatos2 = []
+    for idx, row in df.iterrows():
+        if idx in [idx1, idx3]:
+            continue
+        if str(row["Data_str"]).strip() != str(data1).strip():
+            continue
+        if pd.isna(row["Horario_dt"]) or row["Horario_dt"] is None:
+            continue
+        try:
+            if row["Horario_dt"].time() < hora_min.time():
+                continue
+            if hora_max and row["Horario_dt"].time() > hora_max.time():
+                continue
+        except Exception:
+            continue
+        # geocodificar partida do candidato (para medir proximidade a dispersão do 1º)
+        destino_partida = geocode_address(row["Partida"])
+        if not destino_partida:
+            continue
+        # Distância 1->candidato (origem1 -> partida candidato)
+        try:
+            dist_1_to_cand = geodesic(origem1, destino_partida).km
+        except Exception:
+            continue
+        # Distância candidata dispersao -> partida do 3º
+        origem_cand_disp = geocode_address(row["Dispersao"])
+        destino_partida_3 = geocode_address(row3["Partida"])
+        if not origem_cand_disp or not destino_partida_3:
+            dist_cand_to_3 = None
+        else:
+            try:
+                dist_cand_to_3 = geodesic(origem_cand_disp, destino_partida_3).km
+            except Exception:
+                dist_cand_to_3 = None
+        candidatos2.append({
+            "idx": idx,
+            "Bloco": row["Bloco"],
+            "Horário": row["Horário"],
+            "Partida": row["Partida"],
+            "Distância 1->2 (km)": round(dist_1_to_cand, 3),
+            "Distância 2->3 (km)": round(dist_cand_to_3, 3) if dist_cand_to_3 is not None else None
+        })
+    if not candidatos2:
+        st.info("Nenhum candidato para 2º bloco encontrado com as restrições definidas.")
+    else:
+        cand2_df = pd.DataFrame(candidatos2)
+        # ordenar por soma (quando possível) ou por Distância 1->2
+        def sort_key(row):
+            if pd.notna(row.get("Distância 2->3 (km)")):
+                return row["Distância 1->2 (km)"] + row["Distância 2->3 (km)"]
+            return row["Distância 1->2 (km)"]
+        cand2_df["sort_val"] = cand2_df.apply(sort_key, axis=1)
+        cand2_df = cand2_df.sort_values("sort_val").head(TOP_K).drop(columns=["sort_val"])
+        st.subheader("Sugestões para o 2º (ordenadas por proximidade e compatibilidade com o 3º)")
+        st.dataframe(cand2_df.reset_index(drop=True), use_container_width=True)
 
-                        # botão de download do CSV com os resultados (opcional)
-                        csv_bytes = resultado.to_csv(index=False, sep=",", encoding="utf-8").encode("utf-8")
-                        st.download_button("Baixar resultados (CSV)", csv_bytes, file_name="top_blocos_proximos.csv", mime="text/csv")
-        elif tentar_novamente:
-            st.info("Digite outra parte do nome do bloquinho no campo acima.")
+
+# Caso D: todos os três informados -> apenas mostrar confirmação/resumo e verificar consistência
+else:
+    st.subheader("Rota completa informada (1º, 2º e 3º)")
+    row2 = get_row_by_index(df, idx2)
+    row3 = get_row_by_index(df, idx3)
+    st.write("**Resumo**")
+    st.write(f"1) {row1['Bloco']} — {row1['Data_str']} — {row1['Horário']}")
+    st.write(f"2) {row2['Bloco']} — {row2['Data_str']} — {row2['Horário']}")
+    st.write(f"3) {row3['Bloco']} — {row3['Data_str']} — {row3['Horário']}")
+    # verificações simples de ordem temporal e data
+    if row2["Data_str"] != row1["Data_str"] or row3["Data_str"] != row1["Data_str"]:
+        st.warning("Os blocos não estão todos no mesmo dia — verifique a sequência desejada.")
+    if pd.notna(row2["Horario_dt"]) and pd.notna(row1["Horario_dt"]) and row2["Horario_dt"].time() < row1["Horario_dt"].time():
+        st.warning("O horário do 2º é anterior ao do 1º — verifique a ordem.")
+    if pd.notna(row3["Horario_dt"]) and pd.notna(row2["Horario_dt"]) and row3["Horario_dt"].time() < row2["Horario_dt"].time():
+        st.warning("O horário do 3º é anterior ao do 2º — verifique a ordem.")
+    # calcular distâncias para confirmação
+    origem1 = geocode_address(row1["Dispersao"])
+    destino2 = geocode_address(row2["Partida"])
+    origem2 = geocode_address(row2["Dispersao"])
+    destino3 = geocode_address(row3["Partida"])
+    if origem1 and destino2:
+        try:
+            d12 = round(geodesic(origem1, destino2).km, 3)
+            st.write(f"Distância 1→2 (km): {d12}")
+        except Exception:
+            pass
+    if origem2 and destino3:
+        try:
+            d23 = round(geodesic(origem2, destino3).km, 3)
+            st.write(f"Distância 2→3 (km): {d23}")
+        except Exception:
+            pass
+
+# opção de baixar resultados (se houver DataFrames de resultado, ofereça download)
+# (Este bloco é genérico: busca DataFrames presentes no escopo e oferece download simples.)
+st.markdown("---")
+st.caption("Se quiser, copie manualmente ou ajuste o código para criar um CSV com a rota sugerida/selecionada.")
